@@ -27,10 +27,9 @@ The external button on master D2 requests a coordinated wireless reset.
 
 Open [Project.pdsprj](./Project.pdsprj) in a compatible version of Proteus.
 **This is the final wireless project, not the previous UART version.**
-It corresponds to [image_nFR24L01.png](./image_nFR24L01.png)
-(the filename uses `nFR`; the radio model is nRF24L01).
+It corresponds to [image_nRF24L01.png](./image_nRF24L01.png).
 
-![Final atmospheric monitoring station circuit using two nRF24L01 radios](./image_nFR24L01.png)
+![Final atmospheric monitoring station circuit using two nRF24L01 radios](./image_nRF24L01.png)
 
 The master is on the left with its sensors, D2 button and radio U4.
 The slave is on the right with its LCD, SD card, indicators, buzzer and

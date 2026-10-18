@@ -3,23 +3,179 @@
 An atmospheric monitoring station using two Arduino Uno boards: a master
 reads the DS1621 and BMP280 sensors, while a slave displays measurements,
 controls visual and audible alerts, and records data to an SD card.
+The two boards now communicate wirelessly through **two nRF24L01 modules**,
+not UART.
+
+## Project status
+
+- **Final Proteus circuit:** [Project.pdsprj](./Project.pdsprj) is the final
+  nRF24L01 version, corresponding to the wireless diagram below.
+- **Simulation:** running in Proteus, with bidirectional radio traffic and
+  measurement display demonstrated in the screenshots.
+- **Real-world testing is in progress.** Physical range, long-term reliability,
+  reset behavior and operation under simultaneous SD/servo load still need
+  hardware verification. Simulation screenshots are not hardware certification.
+
+The master reads temperature and pressure and sends binary packets every
+250 ms. The slave updates a 16x2 LCD, controls status LEDs, a passive buzzer
+and an optional flag servo, and records CSV data at up to one row per second.
+The external button on master D2 requests a coordinated wireless reset.
 
 ## Proteus ISIS project and circuit
 
-The Proteus project is included as [Project.pdsprj](./Project.pdsprj).
-Open it in a compatible version of Proteus to inspect the circuit and
-configure the simulation.
+### Final wireless circuit
 
-![Atmospheric monitoring station circuit in Proteus ISIS](./image.png)
+Open [Project.pdsprj](./Project.pdsprj) in a compatible version of Proteus.
+**This is the final wireless project, not the previous UART version.**
+It corresponds to [image_nFR24L01.png](./image_nFR24L01.png)
+(the filename uses `nFR`; the radio model is nRF24L01).
+
+![Final atmospheric monitoring station circuit using two nRF24L01 radios](./image_nFR24L01.png)
+
+The master is on the left with its sensors, D2 button and radio U4.
+The slave is on the right with its LCD, SD card, indicators, buzzer and
+radio U5. Each Arduino communicates with its own radio over SPI; no UART
+wire connects the boards. The servo is supported by the firmware on slave
+D3 but is not shown in this diagram. Follow the hardware power and protection
+notes below rather than treating simplified simulation wiring as a physical
+build guide.
+
+### Master station close-up
+
+![Master Arduino Uno with DS1621, BMP280, reset button and nRF24L01](./MASTERC.png)
+
+The DS1621 and BMP280 share the master's A4/A5 I2C bus. The nRF24L01
+uses D11/D12/D13 for SPI, D9 for CE and D7 for CSN. The external D2-to-GND
+button starts the wireless reset handshake; the Uno's built-in RESET
+button only restarts that Uno.
+
+### Slave station close-up
+
+![Slave Arduino Uno displaying DS temperature and normal pressure status](./SLAVEC.png)
+
+This running view shows `DS:29.0 C` and `PRESSION NORMALE` on the LCD,
+with the green status LED lit. The PCF8574 provides the LCD's I2C interface.
+The SD card and radio share the slave's SPI bus but have separate selects:
+**SD CS D10 and radio CSN D7**. The blue LED indicates storage status;
+red/green indicators reflect sensor and link conditions.
+
+### Previous UART circuit - historical reference only
+
+![Previous wired UART version of the atmospheric monitoring station](./image_UART.png)
+
+This image documents the earlier D0/D1 wired connection. It does **not**
+represent the final project or the current firmware. Do not reconnect the
+inter-board UART wires when using the nRF24L01 version.
+
+## Required software and libraries
+
+Arduino IDE libraries and Proteus simulation models are separate:
+
+| Environment | Requirement | Purpose |
+| --- | --- | --- |
+| Arduino IDE Boards Manager | Arduino AVR Boards, with Wire timeout support | Compile for Arduino Uno / ATmega328P |
+| Arduino IDE Library Manager | **RF24 by TMRh20, Avamander**; version **1.6.2** used for this setup | Native nRF24L01 radio driver for both sketches |
+| Arduino sketchbook libraries | Included **StationRadio** folder | Shared packet format and matching radio configuration |
+| Arduino IDE Library Manager | LiquidCrystal I2C, compatible with `LiquidCrystal_I2C.h`, `init()` and `backlight()` | Slave 16x2 I2C LCD; earlier setup used version 1.1.2 |
+| Arduino IDE Library Manager | Servo | Slave flag servo |
+| Arduino IDE Library Manager | **SdFat by Bill Greiman, version 2.x** | Slave FAT16/FAT32 recording using SdFat32 |
+| Proteus | Arduino Uno simulation models, if missing | Simulate the two boards |
+| Proteus | TEP nRF24L01 library **and model DLL** | Simulate the two radios |
+| SD image utility | WinImage or an equivalent tool | Prepare and extract the simulated SD card image |
+
+The master uses Wire directly for the sensors and does not need
+Adafruit_BMP280. Wire and SPI come with the Arduino AVR platform.
+**BTLE by Florian Echtler is not a replacement for RF24**: this station
+uses native nRF24L01 communication, not Bluetooth LE advertising.
+
+### Install RF24 and the other IDE libraries
+
+1. In Arduino IDE, open **Boards Manager** and install **Arduino AVR Boards**.
+2. Open **Library Manager**, search for **RF24** and install the entry by
+   **TMRh20, Avamander**. Version **1.6.2** is the version used in this setup.
+3. Install **LiquidCrystal I2C**, **Servo** and **SdFat 2.x** for the slave.
+   Do not substitute the older `SD.h` library for SdFat.
+4. Select **Arduino Uno** under **Tools > Board** for both sketches.
+
+### Install the included StationRadio library
+
+StationRadio is a **local library supplied with this repository**, not an
+extra Proteus component and not a Library Manager search result. It depends
+on RF24 and must be available when compiling either sketch.
+
+1. Download or clone the complete repository.
+2. In Arduino IDE, open **File > Preferences** and find **Sketchbook location**.
+   Use that path, which may be under Documents, OneDrive or a custom folder.
+3. Inside that sketchbook, create a folder named `libraries` if needed.
+4. Copy the entire [StationRadio](./StationRadio) folder from this repository
+   into `libraries`. Keep its `src` folder and `library.properties` file:
+
+   ```text
+   <Sketchbook location>
+   └── libraries
+       └── StationRadio
+           ├── library.properties
+           └── src
+               └── StationRadio.h
+   ```
+
+5. Restart Arduino IDE if it was open. Open
+   [MASTER/MASTER.ino](./MASTER/MASTER.ino) and
+   [SLAVE/SLAVE.ino](./SLAVE/SLAVE.ino) from their respective sketch folders.
+   Both include `#include <StationRadio.h>`.
+6. Compile each sketch for Arduino Uno. For Proteus, use **Sketch > Export
+   Compiled Binary**, then select the corresponding exported `.hex` in each
+   simulated Uno's **Program File** property. For physical boards, select
+   the appropriate port and upload each sketch to its own Uno.
+
+After an update to StationRadio, **replace the installed folder with the
+repository's updated version, recompile both sketches and reload both
+firmware files**. Otherwise, Arduino IDE may keep using an older installed
+copy with different timing or protocol settings.
+
+- `StationRadio.h: No such file or directory`: check the sketchbook location
+  and folder structure; avoid an extra `StationRadio/StationRadio` nesting.
+- `RF24.h: No such file or directory`: install RF24 through Library Manager.
+- Proteus model/DLL errors are unrelated to these Arduino header errors;
+  follow the next section.
+
+### Install the nRF24L01 Proteus model
+
+**The nRF24L01 model used here is not available natively in Proteus.**
+Download and install the external library from the package used for this
+project:
+
+**[Download the TEP nRF24L01 Proteus library](https://www.theengineeringprojects.com/project-file/blog/nrf24l01-proteus-library/1)**
+
+The publisher also provides an
+[installation walkthrough](https://www.theengineeringprojects.com/2026/09/nrf24l01-proteus-library.html).
+
+1. Close Proteus and extract the complete downloaded archive.
+2. Copy the package's radio library files, including `TEPNRF24L01.LIB`,
+   into the **LIBRARY** folder of the Proteus installation you use.
+3. Copy **`TEPNRF24L01.DLL`** into that installation's **MODELS** folder.
+   Install any other supplied model dependencies according to the publisher's
+   instructions. Use matching library and DLL versions from the same package.
+4. Restart Proteus and open [Project.pdsprj](./Project.pdsprj).
+   The final project already contains the two radio components.
+
+A typical installation root is
+`C:\Program Files (x86)\Labcenter Electronics\Proteus 8 Professional`,
+but the location depends on your installation. Installing RF24 in Arduino
+IDE does **not** install the Proteus model.
+
+If Proteus reports **`External model DLL "TEPNRF24L01.DLL" not found`** with
+**`GLE=0x0000007E`**, check the MODELS location and package dependencies:
+Windows may be unable to find the DLL itself or one of the DLLs it needs.
+Check the publisher's version requirements; do not download replacement
+DLLs from unrelated DLL websites.
 
 ### Simulation setup
 
 1. Open [Project.pdsprj](./Project.pdsprj) in Proteus.
-2. You may need to download and install an **Arduino library for Proteus**
-   if the Arduino Uno models are not available in your installation.
-   Any other missing component models must also be installed. These Proteus
-   simulation libraries are separate from the Arduino IDE sketch libraries
-   listed below.
+2. Install the IDE libraries, local StationRadio library and Proteus models
+   described above. If your installation lacks the Arduino Uno or other
+   component models, install those as well.
 3. Compile [MASTER/MASTER.ino](./MASTER/MASTER.ino) and
    [SLAVE/SLAVE.ino](./SLAVE/SLAVE.ino) for Arduino Uno in the Arduino IDE,
    export the compiled binaries, and set each simulated board's program
@@ -43,31 +199,29 @@ does not replace the hardware acceptance checks at the end of this README.
 - TEST1: LCD address `0x27`, 16 columns / 2 rows, red LED D6, green LED D5,
   button D4 to GND with `INPUT_PULLUP`. Its button toggles LEDs, not reset.
 - TEST2 and TEST4: UART commands between boards on D0/D1.
-  They use SoftwareSerial on the hardware UART pins. The final sketches use
-  hardware `Serial` instead, without USB debug output contaminating the link.
+  They use SoftwareSerial on the hardware UART pins. They are historical
+  wired tests, not tests of the final nRF24L01 communication.
 - TEST3: DS1621 at `0x48`, BMP280 at `0x76` or `0x77`, sensor acquisition,
   9600-baud measurement frames and a 3 ms Wire timeout. That test uses D10/D11;
-  the final sketches use D0/D1 as requested. It only detects the BMP280 at boot
+  the final sketches use the nRF24L01 instead. It only detects the BMP280 at boot
   and does not check each later transaction or retry after disconnection.
 
 The original tests are unchanged.
 
-## Upload and wiring
+## Wiring
 
-Upload `MASTER/MASTER.ino` to one **Arduino Uno**, and `SLAVE/SLAVE.ino` to
-the other. Use an up-to-date **Arduino AVR Boards** package with Wire timeout
-support. The slave needs the same **LiquidCrystal_I2C** library as TEST1,
-plus the Arduino **Servo** library and **SdFat by Bill Greiman (version 2.x)**.
-Install SdFat from the Arduino IDE Library Manager. The sketch uses SdFat32
-to check actual write/sync results; it does not use the older SD.h wrapper.
-The master uses Wire directly for checked BMP280 transactions and Bosch
-compensation, so it does not need Adafruit_BMP280.
+Use the final wireless project and these pin assignments. Firmware and
+library installation are covered above.
 
 | Connection | Wiring |
 | --- | --- |
-| UART | Master D1 (TX) -> slave D0 (RX) |
-| UART return/reset acknowledgement | Slave D1 (TX) -> master D0 (RX) |
-| Common reference | Master GND -> slave GND |
+| Each nRF24L01 VCC / GND | Local 3.3 V / local Arduino GND; never 5 V VCC on a bare module |
+| Each nRF24L01 CE | Its Arduino D9 |
+| Each nRF24L01 CSN | Its Arduino D7 (not D10) |
+| Each nRF24L01 MOSI | Its Arduino D11 |
+| Each nRF24L01 MISO | Its Arduino D12 |
+| Each nRF24L01 SCK | Its Arduino D13 |
+| Each nRF24L01 IRQ | Not connected; the sketches poll the radio |
 | Master sensor I2C | DS1621 and BMP280 SDA -> A4, SCL -> A5 |
 | Slave LCD I2C | LCD SDA -> A4, SCL -> A5; address `0x27` |
 | Slave red LED | D6 -> 330 ohm series resistor -> LED -> GND |
@@ -84,6 +238,17 @@ compensation, so it does not need Adafruit_BMP280.
 There is no longer a button on slave D4. D2 is used separately on each
 board: master D2 is the button, slave D2 is the buzzer. Do not join them.
 The servo is now on slave D3, not D8: D8 is only for the blue LED.
+
+The slave's radio and SD card share D11/D12/D13, with independent chip
+selects: **radio CSN D7, SD CS D10**. Both selects are driven HIGH before
+initialization. RF24 and SdFat use SPI transactions; the unselected SD module
+must release MISO. Do not connect both chip selects together.
+
+For real radios, use a stable 3.3 V supply with a 10 uF capacitor and
+100 nF ceramic capacitor close to each module. Use a suitably rated separate
+3.3 V regulator for PA/LNA modules. Keep radio wiring short and isolate
+servo supply noise. Separate wireless stations do not require a ground wire
+between them; each module must share its own Arduino's ground.
 
 Use a suitable regulated supply for the servo, with its ground connected
 to slave GND. Do not power the servo from a GPIO pin; avoid loading the Uno
@@ -110,17 +275,78 @@ Preserve the working sensor power, address-pin wiring and pull-ups from the
 tests. A bare BMP280 is a 3.3 V device: do not apply 5 V power or I2C levels
 unless the breakout explicitly supports them with regulation/level shifting.
 
-**Disconnect the D0/D1 inter-board wires while uploading, then reconnect.**
-Do not use Serial Monitor to send commands or display debug text while the
-boards communicate. Uno USB-serial interfaces also share D0/D1; avoid an
-active USB serial host driving those pins during operation. Power the boards
-appropriately without tying unrelated power supplies together.
+**Remove both D0/D1 inter-board wires permanently.** Serial is now only for
+local diagnostic output at **115200 baud** on either board. Opening Serial
+Monitor can reset an Uno, as usual. Power the boards appropriately without
+tying unrelated power supplies together.
+
+## Radio connection and LCD messages
+
+No manual pairing button is needed. Both radios use channel **76**
+(2476 MHz), **1 Mbps**, low transmit power, 5-byte addresses `ATM01` (master)
+and `ATM02` (slave), 16-bit hardware CRC, automatic ACKs and bounded retries.
+Keep these settings identical in the shared library on both boards.
+These fixed addresses are not authentication or encryption.
+
+| LCD message | Meaning |
+| --- | --- |
+| `INIT NRF24...` / `PATIENTER...` | Initializing storage and the radio |
+| `RADIO OK` / `RECHERCHE MASTER` | Local radio responds over SPI; no valid master measurement yet |
+| `DS:... C` / `MASTER CONNECTE` | First valid measurement received; short confirmation, then normal pages |
+| `LIAISON PERDUE` / `RECHERCHE MASTER` | No valid new measurement for 3.5 seconds |
+| `DS:... C` / `LIEN RETABLI` | Valid measurements resumed after a lost link |
+| `ERREUR NRF24` / `VERIF 3V3 / SPI` | Local radio initialization/presence failed; check supply, CE/CSN and SPI |
+
+Connection confirmations last 700 ms without blocking reception, servo,
+buzzer or logging. Sensor/frame warnings and measured alarms take precedence
+over a connection confirmation. Sensor values can legitimately be `NaN` even
+when the radio is connected; the normal sensor warnings then remain visible
+instead of the success banner. A radio that fails initialization is retried
+every three seconds, and its SPI presence is checked once a second.
+
+The slave sends an application-level acceptance for valid measurements.
+The master's Serial Monitor prints `SLAVE CONNECTED` only after receiving
+that matching reply, not merely after a hardware ACK. It also reports lost
+links, radio failures, transmission failures and reset acceptance. The slave
+prints connection changes and invalid packets to its own Serial Monitor.
+There is no claim that `radio.begin()` alone confirms the other board.
+
+### Master radio control panel
+
+![Master nRF24L01 Advance control panel showing channel, addresses and traffic](./M_CONTROLE.png)
+
+The master sends to `ATM02` and listens on receive pipe 1 at `ATM01`.
+The panel shows channel 76 / 2476 MHz, 1 Mbps, PA_LOW (-12 dBm), 16-bit
+CRC, 5-byte addresses and static 20-byte payloads, matching StationRadio.
+`RX - LISTENING` is normal between transmissions; the master also receives
+the slave's application replies.
+
+In this particular screenshot, 336 transmissions were attempted, 329 were
+acknowledged and 7 reached the retry limit. A missing hardware ACK does not
+prove that the payload was never received. These counters are a snapshot,
+not a long-term reliability measurement.
+
+### Slave radio control panel
+
+![Slave nRF24L01 Advance control panel showing matching settings and reverse addresses](./S_CONTROLE.png)
+
+The slave sends replies to `ATM01` and listens on pipe 1 at `ATM02`.
+Its radio settings match the master's, with the transmit and receive
+addresses reversed. This screenshot shows 337 transmissions, all 337
+acknowledged, and zero retry-limit failures. Different totals between
+screenshots should not be treated as directly synchronized measurements.
+
+Both panels show a simulated distance of 10 m, a received level around
+-80 dBm and approximately 4.7 dB of link margin. Their estimated range of
+about 15 m applies to the model and settings, **not a guaranteed real-world
+range**. `Weak / overload = 0 / 0` reports no such model events in these
+captures. The hexadecimal last-packet display is expected for binary data.
 
 ## LCD and LEDs
 
 A 16x2 LCD cannot fit
 all measurements and messages on one screen.
-Instead, it cycles every 1.8 seconds through three pages:
+Instead, it cycles every 900 ms through three pages:
 
 | First row (always) | Second row |
 | --- | --- |
@@ -128,8 +354,9 @@ Instead, it cycles every 1.8 seconds through three pages:
 | `DS:25.0 C` | `NORMALE TEMP` or `ALERT TEMP` |
 | `DS:25.0 C` | `PRESSION NORMALE` or `ALERT PRESS` |
 
-Displayed values have one decimal place; transmitted values retain six
-decimal places so display rounding does not decide alarms.
+Displayed values have one decimal place; radio packets retain the original
+32-bit floating-point values, so display rounding does not decide alarms.
+CSV output formats those values with six decimal places.
 Only the DS1621 temperature **>= 30.0 C**
 triggers `ALERT TEMP`. Pressure **< 950.0 or > 1050.0 hPa** triggers
 `ALERT PRESS`; the endpoints themselves are normal. These pressure limits
@@ -154,19 +381,19 @@ Missing data and communication faults are visual warnings, not buzzer alarms.
 ## Buzzer and flag servo
 
 - Boot: rising three-note tune; flag centered at 90 degrees for at least
-  900 ms, and stays centered until data arrives (up to the 3.5-second link
+  500 ms, and stays centered until data arrives (up to the 3.5-second link
   timeout). Both LEDs are off while waiting at boot.
 - Normal: green LED, green flag at 0 degrees, no sound.
 - Temperature/pressure alert: red LED, red flag at 180 degrees, continuous
   1600 Hz tone while fresh measurements remain outside the limits.
   Missing DS data, bad frames and lost communication give red LED/flag but
-  no continuous sound. In particular, serial errors caused by an SD retry
+  no continuous sound. In particular, radio errors caused by an SD retry
   must not produce a periodic beep. A missing BMP alone is still only a
   warning when DS temperature is normal.
 - Reset: flag returns to 90 degrees and stays there while the LEDs alternate;
   a falling three-note tune replaces any alarm tone, then stops.
 
-Sound patterns use elapsed time rather than delay(), so the LCD, serial
+Sound patterns use elapsed time rather than delay(), so the LCD, radio
 receiver and servo continue working while notes play.
 
 ## SD recording and blue LED
@@ -175,14 +402,16 @@ The Uno has only 2 KB of RAM, shared by global variables, library buffers,
 temporary variables and function calls. The slave keeps fixed LCD messages,
 log headings and format strings in program memory using F()/PSTR(), and
 uses bounded small text buffers. SD still needs a sector buffer (512 bytes).
-These memory changes have not been compiled or tested; check the Arduino
-IDE's reported global RAM usage and remaining bytes after compilation.
+Check the Arduino IDE's reported global RAM usage and remaining bytes
+after compilation, especially when changing libraries or adding features.
 That report does not include the maximum temporary memory used at runtime,
 so free reported RAM is not itself proof of stability.
 
 - At every slave boot (including after reset), check the card and writable
   FAT16/FAT32 filesystem. Without a usable card, show `SD ABSENTE / HS` once
-  for two seconds, then return to the normal LCD pages. A card/file writing
+  for two seconds when the normal display is available, then return to its
+  pages. Radio error/search and connection messages take precedence, so the
+  SD notice may be deferred until the master connects. A card/file writing
   problem instead shows `ERREUR ECRIT SD`. Red/green LEDs, flag and sound
   still depend on sensor/link alarms, not on missing storage.
 - Blue blinks approximately every 300 ms while recording is unavailable.
@@ -190,7 +419,8 @@ so free reported RAM is not itself proof of stability.
   another reset. Blue stays on only after initialization and saving a
   session header succeed.
 - While a card is ready, check its identity once a second and append the
-  latest checked temperature/pressure sample when received (normally 1 Hz).
+  latest checked temperature/pressure sample, with writes limited to 1 Hz
+  even though radio updates arrive at 4 Hz.
   Check the write, sync and close results; on failure, stop recording,
   blink blue and show one short warning. Resume automatically after a
   usable card is detected again.
@@ -212,7 +442,8 @@ decimal places (wraps after about 49.7 days), not a calendar date. Measurements
 retain six decimals, and alert columns use the original unrounded values:
 DS >= 30 C; pressure < 950 or > 1050 hPa. Missing values are `NaN` with
 `INDISPONIBLE` status, not a normal or measured-alert state.
-Invalid serial frames and stale display values are not logged.
+Invalid radio packets, immediate duplicate samples and stale display values
+are not logged.
 
 The CSV targets French Excel: semicolon-separated columns, decimal commas,
 and an Excel `sep=;` line. Extract the CSV from the stopped Proteus image
@@ -220,7 +451,8 @@ before opening it in Excel. If importing manually, select delimiter `;`,
 French numeric locale and skip the `sep=;` line. For clearer presentation,
 format numeric columns to one or two decimals in Excel; the stored precision
 is retained. Select time and either measurement column to insert a chart.
-These CSV changes have not been compiled or tested, as requested.
+The project owner has run the wireless simulation; real-world SD recording
+and long-duration operation remain part of the hardware testing in progress.
 
 Without a card, measurements continue but are **not stored or replayed**
 later. The Uno cannot write into the PC project directory without a
@@ -234,85 +466,87 @@ exFAT. No automatic formatting is performed.
 
 SD initialization and writes are synchronous library operations: they may
 briefly pause the loop, including the blue blink and animation updates,
-especially with a missing/bad card. Boot initializes storage before the
-serial receiver and tune start. Runtime retries are spaced out and are
+especially with a missing/bad card. Boot starts the radio before attempting
+storage, giving the initial connection and replies priority. SD initialization
+is deferred until a measurement is received or the 3.5-second startup wait
+expires, and the boot melody has finished. Runtime retries are spaced out and are
 not performed during reset or the boot melody. Long card stalls can lose
-serial samples; the Uno does not buffer a recording backlog, and when
+radio samples (the radio's RX FIFO holds only three packets); the Uno does
+not buffer a recording backlog, and when
 multiple samples arrive together only the latest is queued for logging.
 
 Sync/close per entry reduces risk but does not make live card removal or
 power loss safe. Prefer powering down before removing a card; unexpected
 removal can lose the current entry or damage the filesystem.
 
-## Faulty BMP280
+## Wireless packet format
 
-The master checks acknowledgements, byte counts, timeouts, chip ID,
-configuration, repeated calibration/data reads, invalid raw values and
-physical measurement ranges (-40..85 C and 300..1100 hPa).
-On a failed BMP280 read, **both BMP fields become `NaN` immediately in that
-sample**. No previous BMP value is presented as current. The master keeps
-sampling the DS1621 and transmitting, and retries BMP280 discovery at both
-addresses every three seconds. Following recovery, BMP readings resume
-after a new conversion.
-
-During a BMP fault the LCD still shows DS temperature on its first row,
-shows `BMPR:NaN hPa` on its pressure page, and shows `CHECK BMP280` on
-the sensor/pressure status page. A valid DS temperature >= 30 C still shows `ALERT TEMP`
-on the temperature status page. DS1621 failures similarly show `NaN` and
-`CHECK DS1621` and are retried independently.
-A failed DS read gets bounded bus recovery (up to nine SCL pulses and a
-STOP, followed by reinitializing the Uno I2C controller) and one immediate
-retry if the bus is released. Recovery does not reset or change either
-sensor's configuration. If the read remains unavailable, the next sample still attempts a
-read instead of immediately restarting conversion. Successful reads clear
-the fault. Only failures persisting for three seconds trigger DS
-reinitialization. Unavailable readings remain `NaN`, not cached values
-presented as live data.
-
-**Software cannot guarantee detection of every plausible but incorrect
-measurement caused by a loose connection. Repair the solder joints.**
-Also, a BMP280 physically holding SDA/SCL low blocks the DS1621 on the
-same bus: timeouts keep the application responsive, but both sensors can
-then show `NaN`. Continued DS acquisition under that electrical fault
-requires repairing/disconnecting the BMP280 or hardware bus isolation.
-
-The link carries one frame per second:
-`D,<DS temperature>,<BMP temperature>,<pressure>*<4-digit CRC16>\r\n`.
-CRC is CRC-16/CCITT-FALSE over the text before `*`, initial value `0xFFFF`,
-polynomial `0x1021`. `NaN` is an explicit missing reading.
-Invalid/oversized frames are discarded without overwriting good data;
+The link carries **four 20-byte binary measurement packets per second**, not
+the old UART text line (which could exceed the radio's 32-byte limit).
+The shared library defines its 32-bit sequence, three 32-bit floats, station
+magic value, protocol version and message type. The radio's 16-bit CRC checks
+transmission integrity. The slave also checks the header, sensor ranges and
+BMP temperature/pressure availability consistency before updating anything.
+`NaN` is an explicit missing reading. Immediate duplicate measurement
+sequences are acknowledged but do not refresh the timeout or append CSV rows.
+Invalid packets are discarded without overwriting good data;
 `ERREUR TRAME` appears on the status page until a valid frame arrives.
-After 3.5 seconds without a valid frame, the LCD shows `DS:NaN C` and
-`LIAISON PERDUE` rather than stale measurements.
+After 3.5 seconds without a valid new packet, the LCD shows `LIAISON PERDUE`
+and `RECHERCHE MASTER` rather than stale measurements.
 
 ## Button reset
 
 Use the external button on **master D2**, not the Uno's built-in RESET button.
-After 30 ms debounce, the master sends `R`. The slave replies `A`, centers
+After 30 ms debounce, the master sends a `RESET_REQUEST` packet. The slave
+replies with `RESET_ACCEPTED` carrying the same sequence, centers
 the flag, plays the falling reset tune, displays `RESET SYSTEME`, draws a
-progress bar and alternates LEDs with increasing speed for 1.8 seconds.
-It then displays `REDEMARRAGE...` for 800 ms and resets via its watchdog.
-The master waits three seconds after receiving `A` before resetting itself,
+progress bar and alternates LEDs with increasing speed for 900 ms.
+It then displays `REDEMARRAGE...` for 400 ms and resets via its watchdog.
+The master waits 1.6 seconds after receiving acceptance before resetting itself,
 giving the slave time to finish.
 
-If no reply arrives, the master retries `R` every 300 ms for up to 1.5 seconds
-and resets itself after 4.5 seconds total. Repeated `R` requests do not restart
+If no application reply arrives, the master retries the same request every
+100 ms for up to 1.5 seconds and resets itself after 3.1 seconds total.
+A radio hardware ACK alone does not count as reset acceptance. The slave
+defers acceptance by 40 ms to let the master return to receive mode and
+retries failed acceptance transmissions every 40 ms during its reset sequence.
+Measurement replies are deferred by 5 ms and retried for at most 100 ms;
+a missing reply cannot postpone SD work indefinitely.
+Repeated matching requests get another reply but do not restart
 the slave animation. The master cannot guarantee a slave reset if the link
 is broken. Standard Uno Optiboot supports watchdog resets.
 A button held down across reboot requests another reset; release it after
 pressing.
 
+Use the button wired **between master D2 and GND**, held for at least
+100 ms of simulation time. The Uno's built-in RESET button restarts only
+that board and cannot send the wireless reset request. At 115200 baud, the
+master logs `RESET BUTTON PRESSED (D2)`, the request and its acceptance.
+The slave logs `MASTER RESET REQUEST ACCEPTED` when its animation starts.
+
+### Responsiveness and simulation speed
+
+Measurements are read/transmitted every 250 ms; the BMP280 now uses minimum
+standby instead of a one-second pause. The DS1621 still needs roughly
+750 ms for a physical conversion, plus its initial setup wait: sending
+faster does not make that sensor convert faster. LCD drawing is limited to
+20 refresh opportunities per second and radio FIFO polling to once per
+2 ms when empty, avoiding unnecessary SPI/I2C work. Alert/servo decisions
+still run each loop. CSV logging remains limited to one row per second.
+
+These times are **simulation time**, not guaranteed wall-clock time. Proteus
+may still run slower than real time. A steady blue LED means the card was
+initialized successfully; it does not prove how fast the simulation runs.
+An unlit blue LED is different from a steady lit LED and needs checking.
+Synchronous SD operations can still delay reception/reset handling.
+
 ## Hardware acceptance checks
 
-The previous version of both sketches compiled for `arduino:avr:uno` with
-Arduino AVR Boards 1.8.8 and LiquidCrystal I2C 1.1.2.
-Previous host simulations passed Bosch compensation,
-DS1621 initialization timing/negative temperatures, sensor failures and
-recovery, LCD pages, alarm boundaries, frame validation, link timeout,
-button debounce, animation and the reset handshake/fallback.
-The latest SD recording, master-button, buzzer, servo and DS-only temperature changes
-have not been compiled or tested,
-as requested; compilation is being handled in the Arduino IDE.
+**Real-world testing is in progress.** The project owner has demonstrated
+the running Proteus simulation and radio traffic shown above. This does not
+establish that every fault, reset and storage case below has passed on
+physical boards. Use this checklist for continued Proteus and hardware
+validation; measured range and long-term reliability are not yet established.
 
 1. Boot: rising tune and centered flag, then DS temperature and BMP pressure
    appear; normal readings give green LED/flag and silence.
@@ -324,7 +558,9 @@ as requested; compilation is being handled in the Arduino IDE.
    DS below 30 C gives green and `NORMALE TEMP`; DS at or above 30 C
    gives red and `ALERT TEMP`. The missing BMP alone does not force red.
 5. Restore BMP280: automatic rediscovery and fresh readings resume.
-6. Disconnect UART: within 3.5 s, `LIAISON PERDUE`, red, no stale data.
+6. Stop the master or interrupt the RF link: within 3.5 s,
+   `LIAISON PERDUE` / `RECHERCHE MASTER`, red, no stale data and no link-fault
+   buzzer. Restore it: `LIEN RETABLI`, then normal pages.
 7. Press master D2: centered flag, falling tune, LCD reset message,
    accelerating alternating LEDs, both boards restart.
 8. Disconnect the slave and press master D2: master still restarts after
@@ -335,6 +571,19 @@ as requested; compilation is being handled in the Arduino IDE.
     the new LOGnnnnn.CSV contains elapsed seconds, DS temperatures, BMP
     pressures and separate alert columns.
     Verify actual file contents on a PC after powering down and removing it.
+11. Start with the slave only: `RADIO OK` / `RECHERCHE MASTER` must not
+    claim a connection. Start the master with healthy sensors:
+    `MASTER CONNECTE` appears briefly; its Serial Monitor confirms
+    `SLAVE CONNECTED` after the application reply.
+12. Start the slave without its radio: `ERREUR NRF24` / `VERIF 3V3 / SPI`.
+    Restore the correctly powered radio: automatic retry, then master search.
+13. Confirm SD writes and radio reception work together on the shared SPI
+    bus. Reset while recording; the animation must run and the next boot
+    must create a new CSV session.
 
 These checks must be performed on the actual boards; host-side tests cannot
 reproduce loose solder joints, bus wiring or the physical LCD.
+
+---
+
+Made with love by HAMZA Z

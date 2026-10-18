@@ -9,8 +9,8 @@
 #include <avr/wdt.h>
 #include <avr/pgmspace.h>
 #include <math.h>
-#include <stdlib.h>
 #include <string.h>
+#include <StationRadio.h>
 
 // Run before setup(). Turn off the watchdog left active by a software reset.
 // The watchdog is a timer that can restart the Arduino.
@@ -37,13 +37,34 @@ const float TEMP_LIMIT = 30.0f;
 const float PRESSURE_MIN = 950.0f;
 const float PRESSURE_MAX = 1050.0f;
 // Times are in milliseconds: 1000 ms = 1 second.
-const unsigned long LINK_TIMEOUT_MS = 3500;
-const unsigned long PAGE_MS = 1800;
-const unsigned long ANIMATION_MS = 1800;
-const unsigned long BOOT_MS = 900;
+const unsigned long LINK_TIMEOUT_MS = StationRadio::LINK_TIMEOUT_MS;
+const unsigned long PAGE_MS = 900;
+const unsigned long ANIMATION_MS = 900;
+const unsigned long BOOT_MS = 500;
 const unsigned long SD_RETRY_MS = 5000;
 const unsigned long SD_CHECK_MS = 1000;
 const unsigned long SD_NOTICE_MS = 2000;
+const unsigned long LINK_NOTICE_MS = 700;
+const unsigned long LOG_MS = 1000;
+const unsigned long DISPLAY_MS = 50;
+StationRadio::Link radioLink(false);
+bool radioWasReady = false;
+bool linkNotice = false;
+bool linkRestored = false;
+bool radioLinkLost = false;
+unsigned long linkNoticeStarted = 0;
+uint32_t lastMeasurementSequence = 0;
+uint32_t resetSequence = 0;
+bool resetReplyPending = false;
+unsigned long lastResetReply = 0;
+bool measurementReplyPending = false;
+uint32_t measurementReplySequence = 0;
+unsigned long measurementReplyAt = 0;
+unsigned long measurementReplyStarted = 0;
+bool replyFailed = false;
+unsigned long lastDisplay = 0;
+unsigned long lastLog = 0;
+bool storageAttempted = false;
 
 // SdFat32 uses FAT16/FAT32 cards, not exFAT.
 // Its sync() result lets us check that saving really succeeded.
@@ -119,18 +140,6 @@ void setIndicators(bool alarm, unsigned long now) {
   moveFlag(alarm ? RED_POS : GREEN_POS);
 }
 
-// Make the same check number (CRC) as the master.
-// If it differs from the received number, reject the damaged message.
-uint16_t crc16(const char *text) {
-  uint16_t crc = 0xFFFF;
-  while (*text) {
-    crc ^= uint16_t(uint8_t(*text++)) << 8;
-    for (uint8_t i = 0; i < 8; ++i)
-      crc = (crc & 0x8000) ? (crc << 1) ^ 0x1021 : crc << 1;
-  }
-  return crc;
-}
-
 // Show text on LCD row 0 (top) or row 1 (bottom).
 // Fill unused positions with spaces to erase old letters.
 // Skip the write if the row already shows the same text.
@@ -178,7 +187,7 @@ void updateBlueLed(unsigned long now) {
 void storageFailed(unsigned long now, bool writeError) {
   if (sdReady) {
     sdNotice = true;
-    sdNoticeStarted = now;
+    sdNoticeStarted = 0;
   }
   sdReady = false;
   sdWriteError = writeError;
@@ -276,7 +285,7 @@ void logMeasurement() {
   if (!appendRecord(line)) storageFailed(millis(), true);
 }
 
-// Check a working card once a second, and retry an unavailable card every 5 s.
+// Limit CSV writes to 1 Hz even though radio measurements arrive at 4 Hz.
 // There is no card-detect wire: an actual SPI reply checks presence/identity.
 // Samples received without a ready card are not saved for later.
 void serviceStorage(unsigned long now) {
@@ -292,110 +301,134 @@ void serviceStorage(unsigned long now) {
   }
   now = millis();
   if (!sdReady) {
-    if (now - lastSdAttempt >= SD_RETRY_MS) {
-      startStorage();
+    if (!storageAttempted || now - lastSdAttempt >= SD_RETRY_MS) {
+      storageAttempted = true;
+      bool mounted = startStorage();
+      if (!mounted) {
+        sdNotice = true;
+        sdNoticeStarted = 0;
+        Serial.println(F("SD unavailable - continuing without recording"));
+      }
       lastSdAttempt = millis();
       lastSdCheck = lastSdAttempt;
     }
     updateBlueLed(millis());
     return;
   }
-  if (pending) logMeasurement();
+  if (pending && now - lastLog >= LOG_MS) {
+    lastLog = now;
+    logMeasurement();
+  }
   updateBlueLed(millis());
 }
 
-// Turn one received text field into a number within the allowed range.
-// "NaN" is allowed and means that this sensor reading is unavailable.
-// Return false for invalid text; on success, put the result into value.
-bool parseValue(const char *text, float minimum, float maximum, float &value) {
-  if (strcmp_P(text, PSTR("NaN")) == 0) {
-    value = NAN;
-    return true;
+void serviceRadio(unsigned long now) {
+  radioLink.service(now);
+  bool ready = radioLink.isReady();
+  if (ready != radioWasReady) {
+    Serial.println(ready ? F("NRF24 OK - waiting for master") :
+                           F("NRF24 ERROR - check 3.3V/SPI; retrying"));
+    radioWasReady = ready;
+    if (!ready) radioLinkLost = true;
+    linkNotice = false;
+    refreshDisplay = true;
   }
-  // Allow an optional minus sign, digits, and one decimal point.
-  const char *cursor = text;
-  if (*cursor == '-') ++cursor;
-  bool digit = false, dot = false;
-  for (; *cursor; ++cursor) {
-    if (*cursor >= '0' && *cursor <= '9') digit = true;
-    else if (*cursor == '.' && !dot) dot = true;
-    else return false;
-  }
-  if (!digit) return false;
-  char *end;
-  value = strtod(text, &end);
-  return *end == '\0' && isfinite(value) && value >= minimum && value <= maximum;
 }
 
-// Check one whole measurement line: its CRC, commas, and three values.
-// Split the text into fields by replacing separators with end-of-text zeros.
-// Update the saved measurements only if every check passes.
-bool parsePacket(char *line) {
-  char *star = strchr(line, '*');
-  if (!star || strlen(star + 1) != 4) return false;
-  for (const char *ch = star + 1; *ch; ++ch)
-    if (!((*ch >= '0' && *ch <= '9') || (*ch >= 'A' && *ch <= 'F'))) return false;
-  uint16_t checksum = strtoul(star + 1, NULL, 16);
-  *star = '\0';
-  if (crc16(line) != checksum || strncmp_P(line, PSTR("D,"), 2) != 0) return false;
-
-  char *ds = line + 2;
-  char *bm = strchr(ds, ',');
-  if (!bm) return false;
-  *bm++ = '\0';
-  char *pressure = strchr(bm, ',');
-  if (!pressure) return false;
-  *pressure++ = '\0';
-  if (strchr(pressure, ',')) return false;
-
-  // Check temporary values first so a bad message cannot partly update the data.
-  // BMP temperature and pressure must either both be numbers or both be NaN.
-  float newDs, newBm, newPressure;
-  if (!parseValue(ds, -55.0f, 125.0f, newDs) ||
-      !parseValue(bm, -40.0f, 85.0f, newBm) ||
-      !parseValue(pressure, 300.0f, 1100.0f, newPressure) ||
-      isnan(newBm) != isnan(newPressure)) return false;
-  dsTemperature = newDs;
-  bmpPressure = newPressure;
-  return true;
+bool sendRadioReply(StationRadio::MessageType type, uint32_t sequence) {
+  bool delivered = radioLink.send(StationRadio::makePacket(type, sequence));
+  if (!delivered && !replyFailed) Serial.println(F("NRF24 reply failed - no radio ACK"));
+  else if (delivered && replyFailed) Serial.println(F("NRF24 reply recovered"));
+  replyFailed = !delivered;
+  return delivered;
 }
 
-// Collect incoming serial characters until a complete line arrives.
-// "R" means the master requests reset. Other lines are checked as measurements
-// during normal operation. Reject lines that are too long or contain bad data.
+// Allow the master to return to RX before transmitting an application reply.
+void serviceReplies(unsigned long now) {
+  if (resetReplyPending) {
+    if (now - lastResetReply < 40) return;
+    bool delivered = sendRadioReply(StationRadio::RESET_ACCEPTED, resetSequence);
+    lastResetReply = millis();
+    resetReplyPending = !delivered;
+    return;
+  }
+  if (measurementReplyPending && now - measurementReplyStarted >= 100) {
+    measurementReplyPending = false;
+    Serial.println(F("NRF24 measurement reply timed out"));
+  }
+  if (measurementReplyPending && now - measurementReplyAt >= 5) {
+    if (sendRadioReply(StationRadio::MEASUREMENT_ACCEPTED, measurementReplySequence)) {
+      measurementReplyPending = false;
+    }
+    measurementReplyAt = millis();
+  }
+}
+
 void receiveData(unsigned long now) {
-  static char line[64];
-  static uint8_t length = 0;
-  static bool overflow = false;
-  while (Serial.available()) {
-    char ch = Serial.read();
-    if (ch == '\r') continue;
-    if (ch == '\n') {
-      line[length] = '\0';
-      if (!overflow && strcmp_P(line, PSTR("R")) == 0) {
-        if (resetState == RUNNING) {
-          resetState = ANIMATING;
-          resetStarted = now;
-          moveFlag(CENTER);
-        }
-        // Repeated requests get a reply but do not restart the animation.
-        Serial.println(F("A"));
-      } else if (resetState == RUNNING) {
-        if (!overflow && parsePacket(line)) {
-          haveData = true;
-          frameError = false;
-          lastData = now;
-          sampleToLog = true;
-        } else {
-          frameError = true;
-        }
+  StationRadio::Packet packet;
+  while (radioLink.receive(packet)) {
+    now = millis();
+    if (!StationRadio::validHeader(packet)) {
+      if (resetState == RUNNING) {
+        frameError = true;
         refreshDisplay = true;
       }
-      length = 0;
-      overflow = false;
-    } else if (ch == '\0') overflow = true;
-    else if (length < sizeof(line) - 1) line[length++] = ch;
-    else overflow = true;
+      Serial.println(F("NRF24 invalid packet header"));
+      continue;
+    }
+    if (packet.type == StationRadio::RESET_REQUEST) {
+      if (resetState == RUNNING) {
+        resetSequence = packet.sequence;
+        resetState = ANIMATING;
+        resetStarted = now;
+        sampleToLog = false;
+        measurementReplyPending = false;
+        moveFlag(CENTER);
+        Serial.println(F("MASTER RESET REQUEST ACCEPTED"));
+      }
+      if (packet.sequence == resetSequence) {
+        resetReplyPending = true;
+        lastResetReply = now;
+      }
+    } else if (packet.type == StationRadio::MEASUREMENT && resetState == RUNNING) {
+      if (!StationRadio::validMeasurement(packet)) {
+        frameError = true;
+        refreshDisplay = true;
+        Serial.println(F("NRF24 invalid sensor values"));
+        continue;
+      }
+      bool reconnecting = !haveData || radioLinkLost || now - lastData >= LINK_TIMEOUT_MS;
+      if (haveData && !reconnecting && packet.sequence == lastMeasurementSequence) {
+        measurementReplyPending = true;
+        measurementReplySequence = packet.sequence;
+        measurementReplyAt = now;
+        measurementReplyStarted = now;
+        continue;
+      }
+      if (reconnecting) {
+        linkRestored = haveData;
+        linkNotice = true;
+        linkNoticeStarted = now;
+        Serial.println(haveData ? F("MASTER LINK RESTORED") : F("MASTER CONNECTED"));
+      }
+      dsTemperature = packet.dsTemperature;
+      bmpPressure = packet.pressure;
+      haveData = true;
+      radioLinkLost = false;
+      frameError = false;
+      lastData = now;
+      lastMeasurementSequence = packet.sequence;
+      sampleToLog = true;
+      refreshDisplay = true;
+      measurementReplyPending = true;
+      measurementReplySequence = packet.sequence;
+      measurementReplyAt = now;
+      measurementReplyStarted = now;
+    } else if (resetState == RUNNING) {
+      frameError = true;
+      refreshDisplay = true;
+      Serial.println(F("NRF24 unexpected packet type"));
+    }
   }
 }
 
@@ -415,18 +448,20 @@ bool pressureAlert() {
 // With BMP missing, use DS temperature and keep showing a CHECK BMP280 warning.
 // If no valid message arrives for 3.5 seconds, stop displaying old measurements.
 void updateNormalDisplay(unsigned long now) {
-  bool stale = !haveData || now - lastData >= LINK_TIMEOUT_MS;
+  bool stale = !radioLink.isReady() || radioLinkLost ||
+               !haveData || now - lastData >= LINK_TIMEOUT_MS;
   bool tempAlert = !stale && temperatureAlert();
   bool pressAlert = !stale && pressureAlert();
   bool haveTemperature = !isnan(dsTemperature);
   // Red: alarm, no usable temperature, bad message, or lost link.
   // Green: usable data with no alarm. Missing BMP alone does not force red.
   // Give the master time to start before calling the first missing message a fault.
-  bool waitingAtBoot = !haveData && now - bootStarted < LINK_TIMEOUT_MS;
+  bool waitingAtBoot = radioLink.isReady() && !haveData &&
+                       now - bootStarted < LINK_TIMEOUT_MS;
   bool alarm = !waitingAtBoot &&
                (stale || !haveTemperature || frameError || tempAlert || pressAlert);
   // Only fresh out-of-range measurements cause the continuous buzzer sound.
-  // A serial error during an SD retry remains visible but is silent.
+  // A radio error during an SD retry remains visible but is silent.
   alarmActive = tempAlert || pressAlert;
   if (waitingAtBoot) {
     alarmActive = false;
@@ -441,22 +476,44 @@ void updateNormalDisplay(unsigned long now) {
     lastPage = now;
     refreshDisplay = true;
   }
+  if (now - lastDisplay < DISPLAY_MS) return;
+  lastDisplay = now;
   if (!refreshDisplay && !stale) return;
   refreshDisplay = false;
-  // DS stays on the top row; the bottom row changes with the page.
-  valueRow(0, PSTR("DS:"), stale ? NAN : dsTemperature, PSTR("C"));
+  if (linkNotice && now - linkNoticeStarted >= LINK_NOTICE_MS) linkNotice = false;
+  if (!radioLink.isReady()) {
+    showFlashRow(0, F("ERREUR NRF24"));
+    showFlashRow(1, F("VERIF 3V3 / SPI"));
+    return;
+  }
+  if (stale) {
+    showFlashRow(0, haveData ? F("LIAISON PERDUE") : F("RADIO OK"));
+    showFlashRow(1, F("RECHERCHE MASTER"));
+    return;
+  }
+  valueRow(0, PSTR("DS:"), dsTemperature, PSTR("C"));
+  // Connection notices never mask a measured alarm or a sensor/frame warning.
+  if (linkNotice && !tempAlert && !pressAlert && !frameError &&
+      haveTemperature && !isnan(bmpPressure)) {
+    showFlashRow(1, linkRestored ? F("LIEN RETABLI") : F("MASTER CONNECTE"));
+    refreshDisplay = true;
+    return;
+  }
+  if (linkNotice && (tempAlert || pressAlert || frameError)) {
+    showFlashRow(1, frameError ? F("ERREUR TRAME") :
+                   tempAlert ? F("ALERT TEMP") : F("ALERT PRESS"));
+    refreshDisplay = true;
+    return;
+  }
   // Show the boot/storage warning briefly, without changing the alarm decision.
   if (sdNotice) {
+    if (sdNoticeStarted == 0) sdNoticeStarted = now;
     if (now - sdNoticeStarted < SD_NOTICE_MS) {
       showFlashRow(1, sdWriteError ? F("ERREUR ECRIT SD") : F("SD ABSENTE / HS"));
       refreshDisplay = true;
       return;
     }
     sdNotice = false;
-  }
-  if (stale) {
-    showFlashRow(1, haveData ? F("LIAISON PERDUE") : F("ATTENTE MASTER"));
-    return;
   }
   switch (page) {
     case 0: valueRow(1, PSTR("BMPR:"), bmpPressure, PSTR("hPa")); break;
@@ -482,7 +539,7 @@ void updateReset(unsigned long now) {
   showFlashRow(0, F("RESET SYSTEME"));
   if (resetState == ANIMATING) {
     // Take turns lighting red and green, faster towards the end.
-    unsigned long step = elapsed < 1000 ? elapsed / 180 : (elapsed - 1000) / 80;
+    unsigned long step = elapsed < 500 ? elapsed / 120 : (elapsed - 500) / 60;
     digitalWrite(RED_LED, (step % 2) ? HIGH : LOW);
     digitalWrite(GREEN_LED, (step % 2) ? LOW : HIGH);
     char progress[17];
@@ -498,7 +555,7 @@ void updateReset(unsigned long now) {
     }
   } else if (resetState == RESET_LOCAL) {
     showFlashRow(1, F("REDEMARRAGE..."));
-    if (elapsed >= 800) {
+    if (elapsed >= 400) {
       // Stop here and let the watchdog restart this Arduino in about 15 ms.
       wdt_enable(WDTO_15MS);
       while (true) {}
@@ -507,7 +564,7 @@ void updateReset(unsigned long now) {
 }
 
 // Run once at power-on or after reset.
-// Prepare LEDs, buzzer, centered flag, serial link and LCD.
+// Deselect both SPI devices before starting storage or the radio.
 void setup() {
   pinMode(RED_LED, OUTPUT);
   pinMode(GREEN_LED, OUTPUT);
@@ -516,27 +573,34 @@ void setup() {
   digitalWrite(BLUE_LED, LOW);
   pinMode(SD_CS_PIN, OUTPUT);
   digitalWrite(SD_CS_PIN, HIGH);
+  pinMode(StationRadio::CSN_PIN, OUTPUT);
+  digitalWrite(StationRadio::CSN_PIN, HIGH);
+  pinMode(StationRadio::CE_PIN, OUTPUT);
+  digitalWrite(StationRadio::CE_PIN, LOW);
   digitalWrite(BUZZER_PIN, LOW);
   digitalWrite(RED_LED, LOW);
   digitalWrite(GREEN_LED, LOW);
   flagServo.attach(SERVO_PIN);
   moveFlag(CENTER);
-  // The first card check may take time. Start receiving only after it finishes.
-  // Later messages are complete lines, so reception can recover at a newline.
-  startStorage();
-  lastSdAttempt = millis();
-  lastSdCheck = lastSdAttempt;
-  Serial.begin(9600);
+  Serial.begin(115200);
   Wire.begin();
   Wire.setWireTimeout(3000, true);
   lcd.init();
   lcd.backlight();
-  showFlashRow(0, F("SYSTEME PRET"));
-  showFlashRow(1, F("ATTENTE MASTER"));
+  showFlashRow(0, F("INIT NRF24..."));
+  showFlashRow(1, F("PATIENTER..."));
+  // Start listening before attempting potentially slow SD initialization.
+  lastSdAttempt = millis();
+  lastSdCheck = lastSdAttempt;
+  radioWasReady = radioLink.begin(millis());
+  Serial.println(radioWasReady ? F("NRF24 OK - waiting for master") :
+                                F("NRF24 ERROR - check 3.3V/SPI; retrying"));
+  showFlashRow(0, radioWasReady ? F("RADIO OK") : F("ERREUR NRF24"));
+  showFlashRow(1, radioWasReady ? F("RECHERCHE MASTER") : F("VERIF 3V3 / SPI"));
   lastPage = millis();
   bootStarted = millis();
-  sdNotice = !sdReady;
-  sdNoticeStarted = bootStarted;
+  sdNotice = false;
+  sdNoticeStarted = 0;
   updateBlueLed(bootStarted);
   updateSound(bootStarted);
 }
@@ -544,12 +608,17 @@ void setup() {
 // Receive data/reset requests, then update LCD, LEDs, flag and sound.
 void loop() {
   unsigned long now = millis();
+  serviceRadio(now);
   receiveData(now);
+  serviceReplies(millis());
+  now = millis();
   if (resetState == RUNNING) {
     updateNormalDisplay(now);
     updateSound(now);
-    // Do not attempt a slow card initialization during the short boot melody.
-    if (now - bootStarted >= BOOT_MS) serviceStorage(now);
+    // Give initial connection and application replies priority over SD setup.
+    if (now - bootStarted >= BOOT_MS &&
+        !measurementReplyPending && !resetReplyPending &&
+        (haveData || now - bootStarted >= LINK_TIMEOUT_MS)) serviceStorage(now);
   } else {
     sampleToLog = false;
     updateReset(now);

@@ -1,10 +1,11 @@
 // MASTER: read the two sensors and send their values to the slave.
-// I2C uses A4 (SDA) and A5 (SCL). Serial uses D0 (RX) and D1 (TX).
+// I2C: A4/A5. nRF24L01: CE D9, CSN D7, SPI D11/D12/D13.
 // NaN means "no usable measurement", not a temperature of zero.
 #include <Wire.h>
 #include <avr/wdt.h>
 #include <math.h>
 #include <string.h>
+#include <StationRadio.h>
 
 // Run before setup(). Turn off the watchdog left active by a software reset.
 // The watchdog is a timer that can restart the Arduino.
@@ -18,8 +19,8 @@ void disableWatchdogAtBoot() {
 const uint8_t DS_ADDRESS = 0x48;
 const uint8_t RESET_BUTTON = 2;  // Button between master D2 and GND.
 const unsigned long RESET_ACK_MS = 1500;
-const unsigned long RESET_FINISH_MS = 3000;
-const unsigned long SAMPLE_MS = 1000;
+const unsigned long RESET_FINISH_MS = 1600;
+const unsigned long SAMPLE_MS = 250;
 const unsigned long RETRY_MS = 3000;
 const unsigned long BUS_RELEASE_US = 3000;
 
@@ -47,6 +48,39 @@ bool resetAcknowledged = false;
 unsigned long resetAt = 0;
 unsigned long lastResetRequest = 0;
 unsigned long resetAcceptedAt = 0;
+StationRadio::Link radioLink(true);
+uint32_t packetSequence = 0;
+uint32_t lastMeasurementSequence = 0;
+uint32_t resetSequence = 0;
+bool measurementSent = false;
+bool linkConfirmed = false;
+bool radioWasReady = false;
+bool transmitFailed = false;
+unsigned long lastRadioAck = 0;
+
+void serviceRadio(unsigned long now) {
+  radioLink.service(now);
+  bool ready = radioLink.isReady();
+  if (ready != radioWasReady) {
+    Serial.println(ready ? F("NRF24 OK - waiting for slave") :
+                           F("NRF24 ERROR - check 3.3V/SPI; retrying"));
+    radioWasReady = ready;
+  }
+  if (linkConfirmed && (!ready || now - lastRadioAck >= StationRadio::LINK_TIMEOUT_MS)) {
+    linkConfirmed = false;
+    Serial.println(F("SLAVE LINK LOST - waiting for valid reply"));
+  }
+}
+
+bool sendRadioPacket(const StationRadio::Packet &packet) {
+  bool delivered = radioLink.send(packet);
+  if (!delivered && !transmitFailed)
+    Serial.println(F("NRF24 TX FAILED - no radio ACK"));
+  else if (delivered && transmitFailed)
+    Serial.println(F("NRF24 TX recovered"));
+  transmitFailed = !delivered;
+  return delivered;
+}
 
 // Return true if the last I2C operation did not time out.
 // A timeout means the sensor or bus took too long to answer.
@@ -237,9 +271,9 @@ bool initializeBMP(uint8_t address) {
       calibration.p1 == 0 || calibration.p1 == 0xFFFF) return false;
 
   // Put the BMP to sleep to change settings, then start repeated measurements.
-  // Use one temperature/pressure sample per measurement and a 1-second pause.
+  // Continuous measurements with minimum standby; do not impose a 1-second pause.
   return writeRegister(address, 0xF4, 0x00) &&
-         writeRegister(address, 0xF5, 0xA0) &&
+         writeRegister(address, 0xF5, 0x00) &&
          writeRegister(address, 0xF4, 0x27);
 }
 
@@ -256,14 +290,13 @@ void findBMP(unsigned long now) {
 // The & symbols let this function update the caller's two variables.
 // Return true only if all checks pass; the caller must discard results on false.
 bool readBMP(float &temperature, float &pressure) {
-  uint8_t id, control, config, raw[6], confirm[6];
+  uint8_t id, control, config, raw[6];
   if (!readRegisters(bmpAddress, 0xD0, &id, 1) || id != 0x58 ||
       !readRegisters(bmpAddress, 0xF4, &control, 1) || control != 0x27 ||
-      !readRegisters(bmpAddress, 0xF5, &config, 1) || config != 0xA0 ||
-      !readRegisters(bmpAddress, 0xF7, raw, sizeof(raw)) ||
-      !readRegisters(bmpAddress, 0xF7, confirm, sizeof(confirm)) ||
-      memcmp(raw, confirm, sizeof(raw)) != 0) return false;
+      !readRegisters(bmpAddress, 0xF5, &config, 1) || config != 0x00 ||
+      !readRegisters(bmpAddress, 0xF7, raw, sizeof(raw))) return false;
 
+  // A burst read is coherent. Two separate bursts may straddle a new conversion.
   // Join the received bytes into the sensor's raw pressure and temperature.
   uint32_t adcP = (uint32_t(raw[0]) << 12) | (uint32_t(raw[1]) << 4) | (raw[2] >> 4);
   uint32_t adcT = (uint32_t(raw[3]) << 12) | (uint32_t(raw[4]) << 4) | (raw[5] >> 4);
@@ -293,61 +326,38 @@ bool readBMP(float &temperature, float &pressure) {
          pressure >= 300.0f && pressure <= 1100.0f;
 }
 
-// Make a short check number (CRC) from the message text.
-// The slave does the same calculation to help detect damaged serial messages.
-// Both boards must use exactly the same calculation.
-uint16_t crc16(const char *text) {
-  uint16_t crc = 0xFFFF;
-  while (*text) {
-    crc ^= uint16_t(uint8_t(*text++)) << 8;
-    for (uint8_t i = 0; i < 8; ++i)
-      crc = (crc & 0x8000) ? (crc << 1) ^ 0x1021 : crc << 1;
-  }
-  return crc;
-}
-
-// Turn a measurement into text for sending.
-// Keep six decimal places, or write "NaN" when the measurement is unavailable.
-void formatValue(float value, char *text) {
-  if (isnan(value)) strcpy(text, "NaN");
-  else dtostrf(value, 0, 6, text);
-}
-
-// Send one line: D,DS temperature,BMP temperature,pressure*CRC.
-// Commas separate the values; the newline tells the slave the message is complete.
+// The radio checks the packet CRC; the slave also validates its type and values.
 void sendMeasurements(float ds, float bm, float pressure) {
-  char dsText[18], bmText[18], pressureText[18], packet[64];
-  formatValue(ds, dsText);
-  formatValue(bm, bmText);
-  formatValue(pressure, pressureText);
-  snprintf(packet, sizeof(packet), "D,%s,%s,%s", dsText, bmText, pressureText);
-  uint16_t crc = crc16(packet);
-  char checksum[6];
-  snprintf(checksum, sizeof(checksum), "*%04X", unsigned(crc));
-  Serial.print(packet);
-  Serial.println(checksum);
+  StationRadio::Packet packet =
+      StationRadio::makePacket(StationRadio::MEASUREMENT, ++packetSequence);
+  packet.dsTemperature = ds;
+  packet.bmpTemperature = bm;
+  packet.pressure = pressure;
+  lastMeasurementSequence = packet.sequence;
+  measurementSent = true;
+  sendRadioPacket(packet);
 }
 
-// Read the slave's reply to our reset request.
-// A means the slave has started its sound, LED animation and return to center.
-void receiveReset(unsigned long now) {
-  static char command[4];
-  static uint8_t length = 0;
-  static bool overflow = false;
-  while (Serial.available()) {
-    char ch = Serial.read();
-    if (ch == '\r') continue;
-    if (ch == '\n') {
-      command[length] = '\0';
-      if (!overflow && strcmp(command, "A") == 0 &&
-          resetPending && !resetAcknowledged) {
-        resetAcknowledged = true;
-        resetAcceptedAt = now;
-      }
-      length = 0;
-      overflow = false;
-    } else if (length < sizeof(command) - 1) command[length++] = ch;
-    else overflow = true;
+// An application reply confirms processing, not just the radio's automatic ACK.
+void receiveReplies(unsigned long now) {
+  StationRadio::Packet packet;
+  while (radioLink.receive(packet)) {
+    if (!StationRadio::validHeader(packet)) {
+      Serial.println(F("NRF24 invalid reply"));
+      continue;
+    }
+    if (packet.type == StationRadio::MEASUREMENT_ACCEPTED &&
+        !resetPending && measurementSent && packet.sequence == lastMeasurementSequence) {
+      lastRadioAck = now;
+      if (!linkConfirmed) Serial.println(F("SLAVE CONNECTED - measurement accepted"));
+      linkConfirmed = true;
+    } else if (packet.type == StationRadio::RESET_ACCEPTED &&
+               resetPending && !resetAcknowledged && packet.sequence == resetSequence &&
+               now - resetAt < RESET_ACK_MS) {
+      resetAcknowledged = true;
+      resetAcceptedAt = now;
+      Serial.println(F("SLAVE RESET ACCEPTED"));
+    }
   }
 }
 
@@ -363,12 +373,16 @@ void checkButton(unsigned long now) {
   }
   if (now - changedAt >= 30 && reading != stable) {
     stable = reading;
+    Serial.println(stable == LOW ? F("RESET BUTTON PRESSED (D2)") :
+                                  F("RESET BUTTON RELEASED (D2)"));
     if (stable == LOW && !resetPending) {
       resetPending = true;
       resetAcknowledged = false;
       resetAt = now;
       lastResetRequest = now;
-      Serial.println("R");
+      resetSequence = ++packetSequence;
+      Serial.println(F("Sending slave reset request"));
+      sendRadioPacket(StationRadio::makePacket(StationRadio::RESET_REQUEST, resetSequence));
     }
   }
 }
@@ -377,8 +391,8 @@ void checkButton(unsigned long now) {
 // Restart the master even if the slave is disconnected.
 void updateReset(unsigned long now) {
   if (!resetAcknowledged && now - resetAt < RESET_ACK_MS &&
-      now - lastResetRequest >= 300) {
-    Serial.println("R");
+      now - lastResetRequest >= 100) {
+    sendRadioPacket(StationRadio::makePacket(StationRadio::RESET_REQUEST, resetSequence));
     lastResetRequest = now;
   }
   bool finished = resetAcknowledged ?
@@ -392,10 +406,13 @@ void updateReset(unsigned long now) {
 }
 
 // Run once at power-on or after reset.
-// Start the serial link and sensor bus, then begin sensor setup.
+// Serial is local diagnostics only; all inter-board traffic uses the radio.
 void setup() {
   pinMode(RESET_BUTTON, INPUT_PULLUP);
-  Serial.begin(9600);
+  Serial.begin(115200);
+  radioWasReady = radioLink.begin(millis());
+  Serial.println(radioWasReady ? F("NRF24 OK - waiting for slave") :
+                                F("NRF24 ERROR - check 3.3V/SPI; retrying"));
   Wire.begin();
   Wire.setWireTimeout(3000, true);
   startDS(millis());
@@ -404,10 +421,12 @@ void setup() {
 }
 
 // Run repeatedly: check reset commands and keep DS setup moving.
-// Once per second, read the sensors and send a new measurement line.
+// Send at 4 Hz; the DS1621 itself converts more slowly than the radio updates.
 void loop() {
   unsigned long now = millis();
-  receiveReset(now);
+  serviceRadio(now);
+  receiveReplies(now);
+  now = millis();
   checkButton(now);
   if (resetPending) {
     updateReset(now);

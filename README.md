@@ -8,6 +8,28 @@ not UART.
 
 ## Project status
 
+### Restored UART firmware
+
+The last committed UART sketches are available separately in
+[UART/MASTER/MASTER.ino](./UART/MASTER/MASTER.ino) and
+[UART/SLAVE/SLAVE.ino](./UART/SLAVE/SLAVE.ino).
+They are restored without changes from commit
+`7c6f1af8fe3ca200e5a938437eac70447a70f966`; the last pre-radio checkpoint
+`446af37` contains identical sketch files. This restoration does not certify
+physical operation and does not change the nRF24L01 firmware elsewhere.
+
+For this UART version only, power off before rewiring, disconnect the radio
+modules and connect master **D1 (TX) -> slave D0 (RX)**, slave **D1 (TX) ->
+master D0 (RX)**, and **GND -> GND**. Do not join unrelated supply positive
+outputs. Both sketches use the hardware Serial port at **9600 baud** for the
+station protocol, not independent diagnostic output.
+**Disconnect the inter-board D0/D1 wires during upload**, then reconnect
+them with power off. Avoid sending text from a Serial Monitor: the Uno's
+USB-serial interface shares D0/D1 and can interfere with the link.
+Other pin assignments remain as listed in the wiring section, excluding
+all radio wiring. Required libraries are Wire, LiquidCrystal I2C, Servo,
+SPI and SdFat 2.x; RF24 and StationRadio are not used by these UART sketches.
+
 - **Final Proteus circuit:** [Project.pdsprj](./Project.pdsprj) is the final
   nRF24L01 version, corresponding to the wireless diagram below.
 - **Simulation:** running in Proteus, with bidirectional radio traffic and
@@ -44,7 +66,9 @@ build guide.
 ![Master Arduino Uno with DS1621, BMP280, reset button and nRF24L01](./MASTERC.png)
 
 The DS1621 and BMP280 share the master's A4/A5 I2C bus. The nRF24L01
-uses D11/D12/D13 for SPI, D9 for CE and D7 for CSN. The external D2-to-GND
+uses D11/D12/D13 for SPI. The current firmware uses **master CE D8 and
+CSN D10**, replacing D9/D7 shown in the saved diagram. Rewire the master
+radio in hardware or Proteus before using the updated firmware. The external D2-to-GND
 button starts the wireless reset handshake; the Uno's built-in RESET
 button only restarts that Uno.
 
@@ -209,14 +233,16 @@ The original tests are unchanged.
 
 ## Wiring
 
-Use the final wireless project and these pin assignments. Firmware and
-library installation are covered above.
+Use these current firmware pin assignments. The saved Proteus project and
+screenshots predate the master CE/CSN change: update the master's CE from
+D9 to D8 and CSN from D7 to D10 in that circuit. Slave wiring is unchanged.
+Firmware and library installation are covered above.
 
 | Connection | Wiring |
 | --- | --- |
 | Each nRF24L01 VCC / GND | Local 3.3 V / local Arduino GND; never 5 V VCC on a bare module |
-| Each nRF24L01 CE | Its Arduino D9 |
-| Each nRF24L01 CSN | Its Arduino D7 (not D10) |
+| Master nRF24L01 CE / CSN | Master D8 / D10 |
+| Slave nRF24L01 CE / CSN | Slave D9 / D7 (not D10: reserved for SD) |
 | Each nRF24L01 MOSI | Its Arduino D11 |
 | Each nRF24L01 MISO | Its Arduino D12 |
 | Each nRF24L01 SCK | Its Arduino D13 |
@@ -237,6 +263,9 @@ library installation are covered above.
 There is no longer a button on slave D4. D2 is used separately on each
 board: master D2 is the button, slave D2 is the buzzer. Do not join them.
 The servo is now on slave D3, not D8: D8 is only for the blue LED.
+Master D8 is independently used for its radio CE. Hardware SPI on Uno
+remains MOSI D11, MISO D12 and SCK D13; changing CE/CSN does not bypass
+those three SPI pins or resolve a fault on them.
 
 The slave's radio and SD card share D11/D12/D13, with independent chip
 selects: **radio CSN D7, SD CS D10**. Both selects are driven HIGH before
@@ -281,6 +310,31 @@ tying unrelated power supplies together.
 
 ## Radio connection and LCD messages
 
+### TEST5: standalone Hello World hardware test
+
+The two examples supplied in `test.md` are adapted in
+[TEST5/EMETTEUR/EMETTEUR.ino](./TEST5/EMETTEUR/EMETTEUR.ino) and
+[TEST5/RECEPTEUR/RECEPTEUR.ino](./TEST5/RECEPTEUR/RECEPTEUR.ino).
+Open each sketch separately and upload EMETTEUR to the master Uno
+(CE D7, CSN D8) and RECEPTEUR to the slave Uno (CE D7, CSN D9).
+These TEST5-only pins match the confirmed standalone test wiring; they differ
+from the full station firmware. The v2 startup banners identify these builds,
+and the `[PINS]` lines print the actual constants used by RF24.
+Both use MOSI D11, MISO D12, SCK D13, local GND and 3.3 V radio power.
+Only RF24 and the built-in SPI library are needed, not StationRadio.
+
+For isolation, disconnect peripherals other than the radios before testing,
+with power off before rewiring. Keep both boards powered simultaneously
+and open their Serial Monitors at **115200 baud**. These tests replace
+the station firmware temporarily and do not run its LCD, sensors or storage.
+The sender transmits `Hello World !!!` once per second using address
+`PIPE1`, channel 76, 1 Mbps and PA_MIN.
+Expect `[TX] ... ACK OK` on the sender and `[RX] ... message=Hello World !!!`
+on the receiver. A hardware ACK confirms radio acknowledgement, not that
+the receiver sketch has printed the message. Both sketches report local
+SPI presence and channel readback periodically. An initialization error
+stops the test until the board is restarted; no automatic retry is performed.
+
 No manual pairing button is needed. Both radios use channel **76**
 (2476 MHz), **1 Mbps**, low transmit power, 5-byte addresses `ATM01` (master)
 and `ATM02` (slave), 16-bit hardware CRC, automatic ACKs and bounded retries.
@@ -309,6 +363,45 @@ that matching reply, not merely after a hardware ACK. It also reports lost
 links, radio failures, transmission failures and reset acceptance. The slave
 prints connection changes and invalid packets to its own Serial Monitor.
 There is no claim that `radio.begin()` alone confirms the other board.
+
+### Serial diagnostics on real boards
+
+Open each board's Serial Monitor at **115200 baud** and capture at least
+15 seconds with both boards powered. Opening the monitor can reset that Uno.
+The `[BOOT MASTER]` / `[BOOT SLAVE] StationRadio diagnostic v2` banner confirms
+the diagnostic build is running. It is also printed on radio reinitialization.
+
+- `[NRF INIT]` identifies the radio pins and the initialization stage.
+  An initialization failure or lost SPI presence points to the local
+  radio/power/SPI interface, not proof of a remote board failure.
+- `[NRF CONFIG]` reads back channel, data rate and payload size; expect
+  `channel=76/76 rate=1Mbps payload=20/20`. TX/RX addresses in this line
+  describe the intended configuration, not register readback.
+- `[NRF STATS]` appears every five seconds. Counters are cumulative since
+  Arduino startup: `tx` counts attempted hardware writes, `ack` successful
+  hardware acknowledgements, `fail` unacknowledged writes, `rx` reads,
+  `headerOK` matching protocol headers, and `rejected` rejected packets.
+  A rejected packet can have a valid header, for example an unexpected reply
+  sequence or invalid sensor values. Writes skipped while not ready are not
+  counted. A hardware ACK alone does not confirm application acceptance.
+- `[NRF RX REJECTED]` shows the reason, decoded header and all 20 raw bytes.
+  Details are limited to one packet per five seconds (the first is immediate);
+  counters still include every rejection. Repeated all-zero/all-FF data
+  suggests checking local SPI/power first, but is not a definitive diagnosis.
+  Other invalid headers can indicate different installed library/firmware
+  versions. Reception is bounded to three packets per loop so a faulty SPI
+  bus cannot trap the sketch in an endless receive loop.
+
+If master `tx` increases but `ack` stays zero, check both radios' supplies,
+wiring and matching settings. If slave `rx` stays zero, no packets have been
+read there. If `rx` rises but `headerOK` stays zero, inspect the raw bytes and
+compare the installed StationRadio versions. `SLAVE CONNECTED` remains the
+master's confirmation that a matching application reply was received.
+`SD unavailable` is a separate storage diagnostic, not a radio ACK error.
+
+**Replace the installed StationRadio library with this repository's updated
+folder, then compile and upload BOTH sketches.** Updating only the sketches
+does not install the shared diagnostics.
 
 ### Master radio control panel
 

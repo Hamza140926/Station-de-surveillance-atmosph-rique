@@ -366,14 +366,14 @@ void serviceReplies(unsigned long now) {
 
 void receiveData(unsigned long now) {
   StationRadio::Packet packet;
-  while (radioLink.receive(packet)) {
+  // Keep display, replies and diagnostics running even with a faulty SPI bus.
+  for (uint8_t received = 0; received < 3 && radioLink.receive(packet); ++received) {
     now = millis();
     if (!StationRadio::validHeader(packet)) {
       if (resetState == RUNNING) {
         frameError = true;
         refreshDisplay = true;
       }
-      Serial.println(F("NRF24 invalid packet header"));
       continue;
     }
     if (packet.type == StationRadio::RESET_REQUEST) {
@@ -394,7 +394,7 @@ void receiveData(unsigned long now) {
       if (!StationRadio::validMeasurement(packet)) {
         frameError = true;
         refreshDisplay = true;
-        Serial.println(F("NRF24 invalid sensor values"));
+        radioLink.reportRejected(packet, F("sensor values out of range or inconsistent BMP NaNs"));
         continue;
       }
       bool reconnecting = !haveData || radioLinkLost || now - lastData >= LINK_TIMEOUT_MS;
@@ -427,7 +427,7 @@ void receiveData(unsigned long now) {
     } else if (resetState == RUNNING) {
       frameError = true;
       refreshDisplay = true;
-      Serial.println(F("NRF24 unexpected packet type"));
+      radioLink.reportRejected(packet, F("unexpected packet type for slave"));
     }
   }
 }

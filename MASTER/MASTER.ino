@@ -1,5 +1,5 @@
 // MASTER: read the two sensors and send their values to the slave.
-// I2C: A4/A5. nRF24L01: CE D9, CSN D7, SPI D11/D12/D13.
+// I2C: A4/A5. nRF24L01: CE D8, CSN D10, SPI D11/D12/D13.
 // NaN means "no usable measurement", not a temperature of zero.
 #include <Wire.h>
 #include <avr/wdt.h>
@@ -341,9 +341,9 @@ void sendMeasurements(float ds, float bm, float pressure) {
 // An application reply confirms processing, not just the radio's automatic ACK.
 void receiveReplies(unsigned long now) {
   StationRadio::Packet packet;
-  while (radioLink.receive(packet)) {
+  // A faulty SPI bus can report an endless stream of available packets.
+  for (uint8_t received = 0; received < 3 && radioLink.receive(packet); ++received) {
     if (!StationRadio::validHeader(packet)) {
-      Serial.println(F("NRF24 invalid reply"));
       continue;
     }
     if (packet.type == StationRadio::MEASUREMENT_ACCEPTED &&
@@ -357,6 +357,8 @@ void receiveReplies(unsigned long now) {
       resetAcknowledged = true;
       resetAcceptedAt = now;
       Serial.println(F("SLAVE RESET ACCEPTED"));
+    } else {
+      radioLink.reportRejected(packet, F("unexpected reply type/sequence or reset state"));
     }
   }
 }
